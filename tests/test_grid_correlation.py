@@ -177,3 +177,295 @@ def test_flux_query_rejects_redirects_without_forwarding_token():
             worker.join(timeout=6)
         assert not worker.is_alive()
     assert requests == ["Token private-token"]
+
+
+def test_fetch_series_skips_nonfinite_and_overflow_values(monkeypatch):
+    from analysis import grid_correlation as gc  # pylint: disable=import-outside-toplevel
+
+    rows = [
+        {"_time": "t1", "_value": "10.5"},
+        {"_time": "t2", "_value": "nan"},
+        {"_time": "t3", "_value": "inf"},
+        {"_time": "t4", "_value": "-inf"},
+        {"_time": "t5", "_value": "1e309"},
+        {"_time": "t6", "_value": "20"},
+        {"_time": "t7"},  # missing value
+    ]
+
+    monkeypatch.setattr(gc, "flux_query", lambda *args, **kwargs: rows)
+    series = gc.fetch_series("http://127.0.0.1:8086", "token", "org", "bucket", 1, "inverter", "gt")
+    assert series == {"t1": 10.5, "t6": 20.0}
+
+
+def test_optional_filtered_gt_does_not_trim_required_window(monkeypatch):
+    """filtered_gt is optional and must not shrink raw, home, or PV samples.
+
+    Synthetic Influx CSV goes through fetch_series, load_window, analyze, and main.
+    Partial and disjoint filtered timestamps stay on their own minutes (NaN holes).
+    They are never compacted and zipped against a different raw minute.
+    """
+    import contextlib
+    import io
+    import json
+    import math
+    import re
+    from datetime import UTC, datetime, timedelta
+
+    from analysis import grid_correlation as gc  # pylint: disable=import-outside-toplevel
+
+    timestamps = [
+        (datetime(2026, 10, 1, tzinfo=UTC) + timedelta(minutes=i)).isoformat() for i in range(60)
+    ]
+    variants = {
+        "absent": [],
+        "partial": timestamps[:10],
+        "disjoint": ["2026-09-30T00:00:00+00:00"],
+        "complete": timestamps,
+    }
+
+    class _Response:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return self.body.encode()
+
+    def opener_for(filtered_times):
+        class Opener:
+            def open(self, request, timeout):
+                assert request.get_header("Authorization") == "Token synthetic-test-token"
+                query = json.loads(request.data)["query"]
+                field = re.search(r'r\._field == "([^"]+)"', query).group(1)
+                selected = filtered_times if field == "filtered_gt" else timestamps
+                header = (
+                    "#datatype,string,long,dateTime:RFC3339,double,string\n"
+                    ",result,table,_time,_value,_field\n"
+                )
+                rows = "".join(
+                    f",_result,0,{stamp},{index + 1},{field}\n"
+                    for index, stamp in enumerate(selected)
+                )
+                return _Response(header + rows)
+
+        return Opener()
+
+    for name, filtered_times in variants.items():
+        monkeypatch.setattr(
+            gc.urllib.request,
+            "build_opener",
+            lambda *args, filtered_times=filtered_times, **kwargs: opener_for(filtered_times),
+        )
+        args = gc.argparse.Namespace(
+            url="http://127.0.0.1:8086",
+            token="synthetic-test-token",
+            org="test",
+            bucket="test",
+            hours=1,
+        )
+        data = gc.load_window(args)
+        report = gc.analyze(data)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            exit_code = gc.main(
+                [
+                    "--url",
+                    args.url,
+                    "--token",
+                    args.token,
+                    "--org",
+                    "test",
+                    "--bucket",
+                    "test",
+                    "--hours",
+                    "1",
+                ]
+            )
+        assert len(data["grid_power"]) == len(data["home_total"]) == len(data["pv_total"]) == 60
+        assert exit_code == 0
+        assert report.startswith("=== Grid Smoothing Analysis ===")
+        assert "samples analyzed: 60" in report
+        if name == "absent":
+            assert data["filtered_gt"] == []
+            assert "filtered_gt   : not available in bucket" in report
+        elif name == "complete":
+            assert data["filtered_gt"] == data["grid_power"]
+            assert "not available in bucket" not in report
+            assert "filtered_gt identical to raw grid" in report
+        elif name == "partial":
+            assert len(data["filtered_gt"]) == 60
+            assert data["filtered_gt"][0] == data["grid_power"][0]
+            assert math.isnan(data["filtered_gt"][10])
+            assert "filtered_gt   : not available in bucket" in report
+            assert "filtered_gt identical to raw grid" not in report
+        elif name == "disjoint":
+            assert len(data["filtered_gt"]) == 60
+            assert all(math.isnan(value) for value in data["filtered_gt"])
+            assert "filtered_gt   : not available in bucket" in report
+            assert "filtered_gt identical to raw grid" not in report
+
+
+def test_required_series_fallback_aligns_fifty_minutes_and_missing_pv_exits_zero(monkeypatch):
+    """Required aliases and a 50-minute stagger, then a missing pv_total.
+
+    grid_power contains only rejected non-finite rows, so the window uses gt.
+    loads_totalusage is empty, so the window uses loads_Total. Annotated synthetic
+    CSV goes through the patched opener into fetch_series, load_window, analyze,
+    and main. Omitting pv_total leaves the required intersection empty.
+    """
+    import contextlib
+    import io
+    import json
+    import re
+    from datetime import UTC, datetime, timedelta
+
+    from analysis import grid_correlation as gc  # pylint: disable=import-outside-toplevel
+
+    base = datetime(2026, 10, 2, tzinfo=UTC)
+
+    def stamp(minute):
+        return (base + timedelta(minutes=minute)).isoformat()
+
+    overlap = range(10, 60)
+    expected_grid = [1000.0 + minute for minute in overlap]
+    expected_home = [2000.0 + minute for minute in overlap]
+    expected_pv = [300.0 + minute for minute in overlap]
+
+    class Response:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return self.body.encode()
+
+    def csv_for(field, samples):
+        header = (
+            "#datatype,string,long,dateTime:RFC3339,double,string\n"
+            ",result,table,_time,_value,_field\n"
+        )
+        rows = "".join(f",_result,0,{when},{value},{field}\n" for when, value in samples)
+        return header + rows
+
+    def samples_for(measurement, field, include_pv):
+        if measurement == "inverter" and field == "grid_power":
+            return [
+                (stamp(10), "nan"),
+                (stamp(11), "inf"),
+                (stamp(12), "-inf"),
+                (stamp(13), "1e309"),
+            ]
+        if measurement == "inverter" and field == "gt":
+            return [(stamp(minute), f"{1000 + minute}") for minute in range(60)]
+        if measurement == "vue" and field == "loads_Total":
+            return [(stamp(minute), f"{2000 + minute}") for minute in range(10, 70)]
+        if measurement == "inverter" and field == "pv_total" and include_pv:
+            return [(stamp(minute), f"{300 + minute}") for minute in overlap]
+        return []
+
+    calls = []
+
+    def install(include_pv):
+        class Opener:
+            def open(self, request, timeout):
+                assert request.get_header("Authorization") == "Token synthetic-test-token"
+                assert timeout == 60
+                assert request.full_url.startswith("http://127.0.0.1:8086/")
+                query = json.loads(request.data)["query"]
+                measurement = re.search(r'r\._measurement == "([^"]+)"', query).group(1)
+                field = re.search(r'r\._field == "([^"]+)"', query).group(1)
+                calls.append((measurement, field))
+                return Response(csv_for(field, samples_for(measurement, field, include_pv)))
+
+        monkeypatch.setattr(gc.urllib.request, "build_opener", lambda *args, **kwargs: Opener())
+
+    args = gc.argparse.Namespace(
+        url="http://127.0.0.1:8086",
+        token="synthetic-test-token",
+        org="test",
+        bucket="test",
+        hours=1,
+    )
+    argv = [
+        "--url",
+        args.url,
+        "--token",
+        args.token,
+        "--org",
+        "test",
+        "--bucket",
+        "test",
+        "--hours",
+        "1",
+    ]
+    expected_calls = [
+        ("inverter", "grid_power"),
+        ("inverter", "gt"),
+        ("inverter", "filtered_gt"),
+        ("vue", "loads_totalusage"),
+        ("vue", "loads_Total"),
+        ("inverter", "pv_total"),
+    ]
+
+    install(True)
+    calls.clear()
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        data = gc.load_window(args)
+    captured = stdout.getvalue()
+    assert calls == expected_calls
+    report = gc.analyze(data)
+    main_out = io.StringIO()
+    with contextlib.redirect_stdout(main_out):
+        exit_code = gc.main(argv)
+
+    assert calls == expected_calls + expected_calls
+    assert data["grid_power"] == expected_grid
+    assert data["home_total"] == expected_home
+    assert data["pv_total"] == expected_pv
+    assert data["filtered_gt"] == []
+    assert 1000.0 not in data["grid_power"]
+    assert "fetched grid_power: 60 minute buckets" in captured
+    assert "fetched home_total: 60 minute buckets" in captured
+    assert "fetched pv_total: 50 minute buckets" in captured
+    assert "time-intersection: 50 aligned buckets (grid_power: -10, home_total: -10)" in captured
+    assert report.startswith("=== Grid Smoothing Analysis ===")
+    assert "samples analyzed: 50" in report
+    assert "Recommended inverter-control local_config.py block:" in report
+    assert "ENABLE_GRID_SMOOTHING_WITH_HOME = True" in report
+    assert exit_code == 0
+    assert "samples analyzed: 50" in main_out.getvalue()
+
+    install(False)
+    calls.clear()
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        missing = gc.load_window(args)
+    missing_out = stdout.getvalue()
+    assert calls == expected_calls
+    missing_report = gc.analyze(missing)
+    missing_main = io.StringIO()
+    with contextlib.redirect_stdout(missing_main):
+        missing_exit = gc.main(argv)
+
+    assert calls == expected_calls + expected_calls
+    assert missing["grid_power"] == []
+    assert missing["home_total"] == []
+    assert missing["pv_total"] == []
+    assert missing["filtered_gt"] == []
+    assert "fetched pv_total: 0 minute buckets" in missing_out
+    assert "time-intersection: 0 aligned buckets (grid_power: -60, home_total: -60)" in missing_out
+    assert missing_report == "Not enough overlapping samples to analyze (need >= 50)."
+    assert "Recommended" not in missing_report
+    assert missing_exit == 0
+    assert missing_report in missing_main.getvalue()

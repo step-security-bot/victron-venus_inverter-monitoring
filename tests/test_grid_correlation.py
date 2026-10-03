@@ -373,9 +373,9 @@ def test_required_series_fallback_aligns_fifty_minutes_and_missing_pv_exits_zero
             return [(stamp(minute), f"{300 + minute}") for minute in overlap]
         return []
 
-    calls = []
-
     def install(include_pv):
+        calls = []
+
         class Opener:
             def open(self, request, timeout):
                 assert request.get_header("Authorization") == "Token synthetic-test-token"
@@ -388,6 +388,7 @@ def test_required_series_fallback_aligns_fifty_minutes_and_missing_pv_exits_zero
                 return Response(csv_for(field, samples_for(measurement, field, include_pv)))
 
         monkeypatch.setattr(gc.urllib.request, "build_opener", lambda *args, **kwargs: Opener())
+        return calls
 
     args = gc.argparse.Namespace(
         url="http://127.0.0.1:8086",
@@ -417,8 +418,7 @@ def test_required_series_fallback_aligns_fifty_minutes_and_missing_pv_exits_zero
         ("inverter", "pv_total"),
     ]
 
-    install(True)
-    calls.clear()
+    calls = install(True)
     stdout = io.StringIO()
     with contextlib.redirect_stdout(stdout):
         data = gc.load_window(args)
@@ -446,8 +446,7 @@ def test_required_series_fallback_aligns_fifty_minutes_and_missing_pv_exits_zero
     assert exit_code == 0
     assert "samples analyzed: 50" in main_out.getvalue()
 
-    install(False)
-    calls.clear()
+    calls = install(False)
     stdout = io.StringIO()
     with contextlib.redirect_stdout(stdout):
         missing = gc.load_window(args)

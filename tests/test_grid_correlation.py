@@ -75,6 +75,30 @@ def test_jitter_distinguishes_sawtooth_from_slow_swing():
     assert jitter(slow) < 15
 
 
+@pytest.mark.parametrize(
+    ("filtered", "expected_jitter"),
+    [
+        ([0.0] * 30 + [math.nan] + [1000.0] * 30, "0.0"),
+        ([0.0, math.nan] * 50, "n/a"),
+        ([0.0, 10.0] * 30, f"{jitter([0.0, 10.0] * 30):.1f}"),
+    ],
+)
+def test_filtered_jitter_uses_only_adjacent_available_samples(filtered, expected_jitter):
+    from analysis.grid_correlation import analyze  # pylint: disable=import-outside-toplevel
+
+    data = {
+        "grid_power": [100.0] * len(filtered),
+        "home_total": [200.0] * len(filtered),
+        "pv_total": [100.0] * len(filtered),
+        "filtered_gt": filtered,
+    }
+    report = analyze(data)
+    line = next(line for line in report.splitlines() if line.startswith("  filtered_gt"))
+    assert line.split("jitter=", 1)[1].split(" W", 1)[0].strip() == expected_jitter
+    assert "sigma=" in line
+    assert "near-zero=" in line
+
+
 def test_sweep_prefers_blending_over_raw_for_sawtooth():
     data = demo_data()
     raw = data["grid_power"]

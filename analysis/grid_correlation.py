@@ -381,8 +381,15 @@ def analyze(data: dict[str, list[float]]) -> str:
         f"zero-cross rate={zero_crossing_rate(raw_n):.4f}  near-zero={near_zero_pct(raw_n):5.1f}%"
     )
     if filt_n:
+        # Missing optional minutes must not create artificial adjacent steps.
+        filtered_steps = [
+            current_filtered[index] - current_filtered[index - 1]
+            for index in range(1, n)
+            if math.isfinite(current_filtered[index - 1]) and math.isfinite(current_filtered[index])
+        ]
+        filtered_jitter = f"{stddev(filtered_steps):6.1f}" if len(filtered_steps) >= 2 else "   n/a"
         lines.append(
-            f"  filtered_gt   : sigma={stddev(filt_n):7.1f} W  jitter={jitter(filt_n):6.1f} W  "
+            f"  filtered_gt   : sigma={stddev(filt_n):7.1f} W  jitter={filtered_jitter} W  "
             f"near-zero={near_zero_pct(filt_n):5.1f}%"
         )
     else:

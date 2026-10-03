@@ -258,9 +258,12 @@ def fetch_series(
         if not t:
             continue
         try:
-            series[t] = float(row["_value"])
-        except (KeyError, ValueError):
+            value = float(row["_value"])
+        except (KeyError, TypeError, ValueError, OverflowError):
             continue
+        if not math.isfinite(value):
+            continue
+        series[t] = value
     return series
 
 
@@ -287,14 +290,28 @@ def load_window(args: argparse.Namespace) -> dict[str, list[float]]:
         series[key] = data
 
     # Fields went live at different times (the vue measurement is brand new), so
-    # analyze only timestamps present in every series - position-based zip would
-    # silently compare different hours of the day against each other.
-    common = sorted(set.intersection(*(set(s) for s in series.values())))
-    dropped = {k: len(v) - len(common) for k, v in series.items()}
+    # analyze only timestamps present in every required series. Position-based
+    # zip would silently compare different hours of the day against each other.
+    # filtered_gt is optional (telegraf marks it optional). It must not shrink
+    # the required window. When filtered samples exist, keep them on the same
+    # timestamps as the required series and leave missing minutes as NaN.
+    # Compacting a partial filtered series and zipping it against raw would
+    # pair a filtered watt reading with a different minute.
+    required = ("grid_power", "home_total", "pv_total")
+    common_times = sorted(set.intersection(*(set(series[key]) for key in required)))
+    filtered = series["filtered_gt"]
+    dropped = {key: len(series[key]) - len(common_times) for key in required}
     if any(dropped.values()):
         note = ", ".join(f"{k}: -{v}" for k, v in dropped.items() if v)
-        print(f"  time-intersection: {len(common)} aligned buckets ({note})")
-    return {k: [v[t] for t in common] for k, v in series.items()}
+        print(f"  time-intersection: {len(common_times)} aligned buckets ({note})")
+    aligned: dict[str, list[float]] = {
+        key: [series[key][stamp] for stamp in common_times] for key in required
+    }
+    if not filtered:
+        aligned["filtered_gt"] = []
+    else:
+        aligned["filtered_gt"] = [filtered.get(stamp, math.nan) for stamp in common_times]
+    return aligned
 
 
 # --------------------------------------------------------------------------- #
@@ -341,9 +358,19 @@ def analyze(data: dict[str, list[float]]) -> str:
     if n < 50:
         return "Not enough overlapping samples to analyze (need >= 50)."
 
-    # load_window already time-aligns everything onto shared minute buckets.
+    # Required series share one timestamp index. Optional filtered_gt uses that
+    # same index, with NaN where the minute is missing. A shorter filtered list
+    # is not timestamp-aligned, so it is never zipped against raw.
     raw_n, der_n = raw[:n], derived[:n]
-    filt_n = current_filtered[:n] if len(current_filtered) >= 50 else []
+    filt_pairs: list[tuple[float, float]] = []
+    if len(current_filtered) == n:
+        filt_pairs = [
+            (raw_value, filt_value)
+            for raw_value, filt_value in zip(raw_n, current_filtered)
+            if math.isfinite(filt_value)
+        ]
+    filt_n = [filt_value for _, filt_value in filt_pairs] if len(filt_pairs) >= 50 else []
+    raw_for_filtered = [raw_value for raw_value, _ in filt_pairs] if filt_n else []
 
     lines.append("=== Grid Smoothing Analysis ===")
     lines.append(f"samples analyzed: {n}")
@@ -354,8 +381,15 @@ def analyze(data: dict[str, list[float]]) -> str:
         f"zero-cross rate={zero_crossing_rate(raw_n):.4f}  near-zero={near_zero_pct(raw_n):5.1f}%"
     )
     if filt_n:
+        # Missing optional minutes must not create artificial adjacent steps.
+        filtered_steps = [
+            current_filtered[index] - current_filtered[index - 1]
+            for index in range(1, n)
+            if math.isfinite(current_filtered[index - 1]) and math.isfinite(current_filtered[index])
+        ]
+        filtered_jitter = f"{stddev(filtered_steps):6.1f}" if len(filtered_steps) >= 2 else "   n/a"
         lines.append(
-            f"  filtered_gt   : sigma={stddev(filt_n):7.1f} W  jitter={jitter(filt_n):6.1f} W  "
+            f"  filtered_gt   : sigma={stddev(filt_n):7.1f} W  jitter={filtered_jitter} W  "
             f"near-zero={near_zero_pct(filt_n):5.1f}%"
         )
     else:
@@ -377,7 +411,7 @@ def analyze(data: dict[str, list[float]]) -> str:
             "WARNING: weak correlation between CT grid and Vue-derived grid."
             " Check that Home Total covers all loads and PV total matches metered PV."
         )
-    if filt_n and all(abs(f - g) < 1e-6 for f, g in zip(filt_n[:100], raw_n[:100])):
+    if filt_n and all(abs(f - g) < 1e-6 for f, g in zip(filt_n[:100], raw_for_filtered[:100])):
         lines.append(
             "NOTE: filtered_gt identical to raw grid -> ENABLE_GRID_SMOOTHING_WITH_HOME"
             " appears disabled in inverter-control; coefficients below have no effect"
